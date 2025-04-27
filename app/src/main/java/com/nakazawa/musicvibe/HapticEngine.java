@@ -20,16 +20,16 @@ import android.media.audiofx.Visualizer;
  */
 @RequiresApi(api = Build.VERSION_CODES.S)
 public class HapticEngine {
-    private static final String TAG = "HapticEngine";
-    private static final int FRAME_MS = 10;
 
+    private static final int FRAME_MS = 10;
     private final Vibrator vibrator;
-    private final boolean useHg;
+    private boolean useHg;               // final を外す
     private HapticGenerator hg;
     private final ArrayBlockingQueue<short[]> pcmQueue = new ArrayBlockingQueue<>(64);
-    private final HandlerThread thread;
-    private final Handler handler;
-    private float userScale = 2.5f;
+    private HandlerThread thread;        // 型を HandlerThread に
+    private Handler handler;             // 型を Handler に
+    private float userScale = 1.0f;
+    private static final String TAG = "HapticEngiine";
 
     // フォールバック用 RMS→ワンショット振動 Runnable
     /**
@@ -106,23 +106,39 @@ public class HapticEngine {
     public HapticEngine(Context ctx, int audioSession) {
         Log.d(TAG, "ctor: audioSession=" + audioSession
                 + "  isAvailable=" + HapticGenerator.isAvailable());
+
+        //――― 1. まず HapticGenerator が使えるか判定 ―――//
+        boolean hgAvailable = HapticGenerator.isAvailable() && audioSession > 0;
+
+        if (hgAvailable) {
+            try {
+                // HapticGenerator 方式
+                hg = HapticGenerator.create(audioSession);
+                hg.setEnabled(true);
+                useHg  = true;
+                thread = null;
+                handler = null;
+            } catch (Exception e) {
+                Log.w(TAG, "HapticGenerator init failed, fall back to primitive", e);
+                useHg = false;
+                hg    = null;
+            }
+        } else {
+            useHg = false;
+            hg    = null;
+        }
+
+        //――― 2. HapticGenerator が使えないときは Visualizer + Primitive 方式 ―――//
+        if (!useHg) {
+            // AudioSessionId が 0 でも Visualizer は「出力ミックス」を取れる
+            setupPrimitiveVisualizer(audioSession);
+            thread  = null;
+            handler = null;
+        }
+
+        //――― 3. 共通で Vibrator を取得 ―――//
         VibratorManager vm = ctx.getSystemService(VibratorManager.class);
         vibrator = vm.getDefaultVibrator();
-
-        if (HapticGenerator.isAvailable()) {
-            // 既存コード（HapticGenerator 利用）
-            hg = HapticGenerator.create(audioSession);
-            hg.setEnabled(true);
-            thread = null;
-            handler = null;
-            useHg = true;
-        } else {
-            // フォールバック：Visualizer を使ったリアルタイム FFT → プリミティブ振動
-            thread = null;
-            handler = null;
-            useHg = false;
-            setupPrimitiveVisualizer(audioSession);
-        }
     }
 
     /**
@@ -219,6 +235,7 @@ public class HapticEngine {
         float highNorm = (float) (highSum / total);
 
         // プリミティブ効果を組み立て
+        boolean hasPrimitive = false;
         VibrationEffect.Composition comp = VibrationEffect.startComposition();
         if (bassNorm > 0.2f) {
             comp.addPrimitive(
@@ -226,6 +243,7 @@ public class HapticEngine {
                     bassNorm,
                     0
             );
+            hasPrimitive = true;
         }
         if (midNorm > 0.2f) {
             comp.addPrimitive(
@@ -233,6 +251,7 @@ public class HapticEngine {
                     midNorm,
                     50
             );
+            hasPrimitive = true;
         }
         if (highNorm > 0.2f) {
             comp.addPrimitive(
@@ -240,24 +259,27 @@ public class HapticEngine {
                     highNorm,
                     100
             );
+            hasPrimitive = true;
         }
 
-        // Composition から VibrationEffect を生成
-        VibrationEffect effect = comp.compose();
-
-        // 互換性チェック：areAllPrimitivesSupported は boolean を返す
-        if (vibrator.areAllPrimitivesSupported(
+        // 実行
+        if (hasPrimitive && vibrator.areAllPrimitivesSupported(
                 VibrationEffect.Composition.PRIMITIVE_CLICK,
                 VibrationEffect.Composition.PRIMITIVE_SPIN,
                 VibrationEffect.Composition.PRIMITIVE_TICK
         )) {
+            // プリミティブが一つ以上／対応済み → compose して振動
+            VibrationEffect effect = comp.compose();
             vibrator.vibrate(effect);
         } else {
+            // フォールバック：最大ノルムでワンショット振動
             float maxNorm = Math.max(bassNorm, Math.max(midNorm, highNorm));
             int amp = (int) (255 * maxNorm * userScale);
-            vibrator.vibrate(
-                    VibrationEffect.createOneShot(FRAME_MS, amp)
-            );
+            if (amp > 0) {
+                vibrator.vibrate(
+                        VibrationEffect.createOneShot(FRAME_MS, amp)
+                );
+            }
         }
     }
 

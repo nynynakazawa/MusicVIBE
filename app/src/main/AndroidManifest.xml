@@ -5,6 +5,7 @@
 
     <!-- Foreground Service を開始 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <!-- 外部ストレージ読み込み権限 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
@@ -12,6 +13,10 @@
     <uses-permission android:name="android.permission.VIBRATE"/>
     <!-- 録音利用権限 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
 
     <application
         android:allowBackup="true"
@@ -24,6 +29,10 @@
         android:theme="@style/Theme.MusicVIVE"
         tools:targetApi="31">
 
+        <service
+            android:name=".CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
         <!-- メイン画面のアクティビティ -->
         <activity
             android:name="com.nakazawa.musicvibe.MainActivity"

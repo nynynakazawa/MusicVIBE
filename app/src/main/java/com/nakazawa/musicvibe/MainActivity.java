@@ -21,16 +21,22 @@ import android.media.audiofx.HapticGenerator;
 import android.content.Intent;
 import android.os.IBinder;
 import androidx.appcompat.widget.SwitchCompat;
+import android.view.View;
+import android.content.Context;
+import android.media.projection.MediaProjectionManager;
 
 public class MainActivity extends AppCompatActivity {
 
-    private Button btnPlay, btnMute, btnLoad;
+    private Button btnPlay, btnMute, btnLoad, btnBackground;
     private TextView txtTitle;
     private SeekBar seek;
     private boolean isBound = false;
     private MusicService.ServiceBinder binder;
     private static final int REQUEST_RECORD = 1001;
     private boolean advancedHapticsEnabled = false;
+    private static final String TAG = "MainActivity";
+    private Handler updateHandler;
+    private static final int REQUEST_CODE_CAPTURE_PERM = 1001;
 
     /** Activity ↔ Service 接続 */
     private final ServiceConnection connection = new ServiceConnection() {
@@ -41,6 +47,7 @@ public class MainActivity extends AppCompatActivity {
         }
         @Override public void onServiceDisconnected(ComponentName name) { isBound = false; }
     };
+
 
     /** mp3 選択 */
     private final ActivityResultLauncher<String[]> filePicker =
@@ -76,18 +83,18 @@ public class MainActivity extends AppCompatActivity {
 
         // ★「Advanced Haptics Generator」用スイッチを追加
         // ② Advanced Haptics Generator スイッチ取得
-        SwitchCompat switchAdvanced = findViewById(R.id.switchAdvanced);  // XML 定義済み Switch  [oai_citation:2‡Android Developers](https://developer.android.com/reference/android/widget/Switch?utm_source=chatgpt.com)
+        SwitchCompat switchAdvanced = findViewById(R.id.switchAdvanced);
 
         // ③ HapticGenerator 対応チェック
-        boolean hgAvailable = HapticGenerator.isAvailable();        // HG サポート端末のみ true  [oai_citation:3‡Android Developers](https://developer.android.com/reference/android/media/audiofx/HapticGenerator?utm_source=chatgpt.com)
-        switchAdvanced.setChecked(false);                           // デフォルト OFF  [oai_citation:4‡Android Developers](https://developer.android.com/reference/android/preference/SwitchPreference?utm_source=chatgpt.com)
-        switchAdvanced.setEnabled(hgAvailable);                     // 非対応時はグレーアウト  [oai_citation:5‡Android Developers](https://developer.android.com/reference/android/view/View?utm_source=chatgpt.com)
+        boolean hgAvailable = HapticGenerator.isAvailable();
+        switchAdvanced.setChecked(false);
+        switchAdvanced.setEnabled(hgAvailable);
 
         // ④ スイッチ操作時のリスナー登録
         switchAdvanced.setOnCheckedChangeListener(
                 (buttonView, isChecked) -> {
                     if (isBound) {
-                        binder.setAdvancedHapticsEnabled(isChecked);    // サービス側で振動生成モードを切替  [oai_citation:6‡Android Developers](https://developer.android.com/reference/android/widget/CompoundButton.OnCheckedChangeListener?utm_source=chatgpt.com)
+                        binder.setAdvancedHapticsEnabled(isChecked);
                     }
                 }
         );
@@ -118,8 +125,46 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        // ▼ BackGround ボタン取得
+        btnBackground = findViewById(R.id.btnBackground);
+
+// ▼ Advanced Haptics スイッチの初期表示制御
+        btnBackground.setVisibility(switchAdvanced.isChecked() ? View.GONE : View.VISIBLE);
+
+// ▼ スイッチの変更時に表示切替
+        switchAdvanced.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            // 既存コード…
+            if (isBound) {
+                binder.setAdvancedHapticsEnabled(isChecked);
+            }
+            // BackGround ボタン表示制御
+            btnBackground.setVisibility(isChecked ? View.GONE : View.VISIBLE);
+        });
+
+// ▼ BackGround ボタン押下時の動作
+        btnBackground.setOnClickListener(v -> requestScreenCapture());
+
         // ⑥ プレーヤーの監視開始
         observePlayer();
+    }
+
+    private void requestScreenCapture() {
+        MediaProjectionManager mpMgr =
+                (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+        startActivityForResult(
+                mpMgr.createScreenCaptureIntent(),
+                REQUEST_CODE_CAPTURE_PERM
+        );
+    }
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CODE_CAPTURE_PERM && resultCode == RESULT_OK) {
+            Intent svc = new Intent(this, CaptureService.class)
+                    .putExtra("resultCode", resultCode)
+                    .putExtra("data", data);
+            startForegroundService(svc);
+        }
     }
 
     /** サービスの起動＆バインドをまとめて呼び出し */
@@ -163,24 +208,21 @@ public class MainActivity extends AppCompatActivity {
 
     /** SeekBar と Player の同期を UI スレッドで更新 */
     private void observePlayer() {
-        final Handler h = new Handler(Looper.getMainLooper());
-        h.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (isBound) {
-                    try {
-                        float duration = binder.getDuration();
-                        if (duration > 0) {
-                            float pos = binder.getPosition() / duration;
-                            seek.setProgress((int) (pos * 1000));
-                            btnPlay.setText(binder.isPlaying() ? "⏸" : "▶︎");
-                        }
-                    } catch (IllegalStateException e) {
+        updateHandler = new Handler(Looper.getMainLooper());
+        Runnable uiUpdateRunnable = new Runnable() {
+            @Override public void run() {
+                if (isBound && binder.isPrepared()) {             // ← ここを追加
+                    float duration = binder.getDuration();        // 安全に呼べる
+                    if (duration > 0f) {
+                        float pos = binder.getPosition() / duration;
+                        seek.setProgress((int) (pos * 1000));
+                        btnPlay.setText(binder.isPlaying() ? "⏸" : "▶︎");
                     }
                 }
-                h.postDelayed(this, 200);
+                updateHandler.postDelayed(this, 200);
             }
-        }, 200);
+        };
+        updateHandler.postDelayed(uiUpdateRunnable, 200);
     }
 
     /** 音量キーで振動スケール調整 */
@@ -196,8 +238,17 @@ public class MainActivity extends AppCompatActivity {
         return super.onKeyUp(keyCode, event);
     }
 
-    @Override protected void onDestroy() {
-        if (isBound) unbindService(connection);
+    @Override
+    protected void onDestroy() {
+        // サービスのバインド解除
+        if (isBound) {
+            unbindService(connection);
+            isBound = false;
+        }
+        // UI 更新用ハンドラのコールバック解除
+        if (updateHandler != null) {
+            updateHandler.removeCallbacksAndMessages(null);
+        }
         super.onDestroy();
     }
 }

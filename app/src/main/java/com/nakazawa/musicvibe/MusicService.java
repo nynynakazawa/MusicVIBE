@@ -30,6 +30,8 @@ public class MusicService extends Service {
     private final IBinder binder = new ServiceBinder();
     private boolean isMuted = false;
     private boolean advancedHapticsEnabled = false;
+    private boolean isPrepared = false;
+
 
     /*──────────────────────────
      * Service lifecycle
@@ -64,6 +66,7 @@ public class MusicService extends Service {
         if (player     != null) {
             player.stop();
             player.release();
+            isPrepared = false;
         }
         super.onDestroy();
     }
@@ -76,18 +79,15 @@ public class MusicService extends Service {
             player.reset();
             player.setDataSource(this, Uri.parse(uriStr));
             player.prepare();
+            isPrepared = true;
             player.start();
             updateNotification("再生中…");
 
             int sessionId = player.getAudioSessionId();
-            if (haptic == null) {
-                haptic = new HapticEngine(this, sessionId);  // HapticGenerator を内部で初期化
-            }
-            attachVisualizer(sessionId);
+            if (haptic != null) haptic.release();
+            haptic = new HapticEngine(this, sessionId);   // Visualizer も内部でセット
 
-            // ← ここを追加：初回再生時にも音量スケールを反映させる
-            updateHapticScale();
-
+            updateHapticScale();                          // 音量に合わせてスケール調整
         } catch (Exception e) {
             Log.e(TAG, "load error", e);
             updateNotification("エラーが発生しました");
@@ -118,11 +118,16 @@ public class MusicService extends Service {
 
     public float getDuration() {
         try {
-            // player が null または準備前の場合、例外を防ぐ
-            return (player != null) ? player.getDuration() : 0f;
+            if (player != null) {
+                // Prepared, Started, Paused, PlaybackCompleted 状態でのみ getDuration() が許可されています
+                return player.getDuration();
+            } else {
+                return 0f;
+            }
         } catch (IllegalStateException e) {
+            // MediaPlayer が不正な状態（Idle や Initialized）で呼び出された場合の例外を抑制
             Log.w(TAG, "getDuration called in wrong state", e);
-            return 0f;  // 不正な状態では 0 を返却
+            return 0f;
         }
     }
 
@@ -203,6 +208,7 @@ public class MusicService extends Service {
      * Binder
      *──────────────────────────*/
     public class ServiceBinder extends Binder {
+        public boolean isPrepared() { return MusicService.this.isPrepared; }
         public void load(String uri)          { MusicService.this.load(uri); }
         public void togglePlayPause()         { MusicService.this.togglePlayPause(); }
         public void toggleMute()              { MusicService.this.toggleMute(); }
@@ -213,6 +219,15 @@ public class MusicService extends Service {
         public void updateHapticScale()       { MusicService.this.updateHapticScale(); }
         public void setAdvancedHapticsEnabled(boolean enabled) { MusicService.this.setAdvancedHapticsEnabled(enabled);
         }
+    }
+
+    /** 外部音声キャプチャ (BackGround ボタン) */
+    public void startBackgroundHaptics() {
+        int sessionId = 0;                                // グローバル出力ミックス
+        if (haptic != null) haptic.release();
+        haptic = new HapticEngine(this, sessionId);       // Visualizer は内部で開始
+        updateHapticScale();
+        Log.d(TAG, "Background haptics started on session " + sessionId);
     }
 
     void setAdvancedHapticsEnabled(boolean enabled) {
