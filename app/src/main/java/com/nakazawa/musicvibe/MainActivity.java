@@ -24,6 +24,8 @@ import androidx.appcompat.widget.SwitchCompat;
 import android.view.View;
 import android.content.Context;
 import android.media.projection.MediaProjectionManager;
+import android.widget.Button;
+
 
 public class MainActivity extends AppCompatActivity {
 
@@ -37,6 +39,12 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "MainActivity";
     private Handler updateHandler;
     private static final int REQUEST_CODE_CAPTURE_PERM = 1001;
+    private static final int REQUEST_BACKGROUND = 2002;
+    private static final String TEXT_BG_START = "BackGround";
+    private static final String TEXT_BG_STOP  = "StopBackGround";
+
+    private boolean isBackgroundMode = false;   // 現在バックグラウンド処理中かどうか
+
 
     /** Activity ↔ Service 接続 */
     private final ServiceConnection connection = new ServiceConnection() {
@@ -121,7 +129,7 @@ public class MainActivity extends AppCompatActivity {
         switchAdvanced.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (isBound) {
                 // ServiceBinder にメソッドを追加して制御（要実装）
-                binder.setAdvancedHapticsEnabled(isChecked);                                // 切り替え  [oai_citation:1‡Microsoft Learn](https://learn.microsoft.com/en-us/dotnet/api/android.media.audiofx.hapticgenerator.isavailable?view=net-android-35.0&utm_source=chatgpt.com)
+                binder.setAdvancedHapticsEnabled(isChecked);
             }
         });
 
@@ -142,7 +150,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
 // ▼ BackGround ボタン押下時の動作
-        btnBackground.setOnClickListener(v -> requestScreenCapture());
+        setupBackgroundButton();
 
         // ⑥ プレーヤーの監視開始
         observePlayer();
@@ -156,15 +164,59 @@ public class MainActivity extends AppCompatActivity {
                 REQUEST_CODE_CAPTURE_PERM
         );
     }
+
+    private void setupBackgroundButton() {
+        btnBackground = findViewById(R.id.btnBackground);
+        btnBackground.setText(R.string.bg_start);
+
+        btnBackground.setOnClickListener(v -> {
+            if (!isBackgroundMode) {
+                // ① RECORD_AUDIO の許可確認／要求
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                        != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(
+                            this,
+                            new String[]{ Manifest.permission.RECORD_AUDIO },
+                            REQUEST_BACKGROUND
+                    );
+                } else {
+                    // ② スクリーンキャプチャ許可を要求 → onActivityResult で開始
+                    requestScreenCapture();
+                }
+            } else {
+                // 停止処理
+                binder.stopBackgroundHaptics();
+                stopService(new Intent(this, CaptureService.class));
+                btnBackground.setText(R.string.bg_start);
+                isBackgroundMode = false;
+            }
+        });
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQUEST_CODE_CAPTURE_PERM && resultCode == RESULT_OK) {
-            Intent svc = new Intent(this, CaptureService.class)
-                    .putExtra("resultCode", resultCode)
-                    .putExtra("data", data);
-            startForegroundService(svc);
+
+        if (requestCode == REQUEST_CODE_CAPTURE_PERM) {
+            if (resultCode == RESULT_OK && data != null) {
+                // CaptureService を起動してバックグラウンド処理を開始
+                Intent svc = new Intent(this, CaptureService.class)
+                        .putExtra("resultCode", resultCode)
+                        .putExtra("data", data);
+                ContextCompat.startForegroundService(this, svc);
+
+                // ボタン表示を StopBackGround に切り替え
+                btnBackground.setText(R.string.bg_stop);
+                isBackgroundMode = true;
+            } else {
+                Toast.makeText(this,
+                        "キャプチャ許可が得られませんでした",
+                        Toast.LENGTH_SHORT
+                ).show();
+            }
+            return;
         }
+
     }
 
     /** サービスの起動＆バインドをまとめて呼び出し */
@@ -180,13 +232,13 @@ public class MainActivity extends AppCompatActivity {
                                            @NonNull String[] permissions,
                                            @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQUEST_RECORD) {
+        if (requestCode == REQUEST_BACKGROUND) {
             if (grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                startAndBindService();
+                requestScreenCapture();
             } else {
                 Toast.makeText(this,
-                        "録音権限がないとハプティクスが動作しません",
+                        "録音権限がないとバックグラウンドキャプチャできません",
                         Toast.LENGTH_LONG
                 ).show();
             }

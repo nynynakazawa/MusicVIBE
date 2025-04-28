@@ -18,7 +18,6 @@ import android.os.Build;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import androidx.core.app.NotificationCompat;
-import android.content.pm.ServiceInfo;
 import android.app.Notification;                           // Notification クラス  [oai_citation:0‡Android Developers](https://developer.android.com/reference/android/app/Notification?utm_source=chatgpt.com)
 import android.media.AudioFormat;
 import java.util.Arrays;
@@ -35,6 +34,8 @@ public class CaptureService extends Service {
     private static final int SAMPLE_RATE  = 44100;
     private static final int CHANNEL_MASK = AudioFormat.CHANNEL_IN_MONO;
     private static final int ENCODING     = AudioFormat.ENCODING_PCM_16BIT;
+
+
 
     @Override
     public void onCreate() {
@@ -69,6 +70,12 @@ public class CaptureService extends Service {
             Log.e(TAG, "RECORD_AUDIO permission not granted");
             stopSelf();
             return START_STICKY;
+        }
+
+        if (intent == null) {
+            Log.e(TAG, "onStartCommand: intent is null, stopping CaptureService");
+            stopSelf();
+            return START_NOT_STICKY;
         }
 
         // 画面キャプチャ許可データ取得
@@ -114,10 +121,20 @@ public class CaptureService extends Service {
         haptic = new HapticEngine(this, 0);
         new Thread(() -> {
             short[] buffer = new short[bufferSize / 2];
-            while (recorder.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
-                int read = recorder.read(buffer, 0, buffer.length);
+            while (recorder != null
+                    && recorder.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                int read;
+                try {
+                    read = recorder.read(buffer, 0, buffer.length);
+                } catch (Exception e) {
+                    Log.w(TAG, "AudioRecord.read failed, stopping loop", e);
+                    break;  // 読み取り中に例外が出たら安全に抜ける
+                }
                 if (read > 0) {
                     haptic.onPCM(Arrays.copyOf(buffer, read));
+                } else if (read < 0) {
+                    Log.w(TAG, "AudioRecord.read returned error: " + read);
+                    break;  // エラーコードが返ったら抜ける
                 }
             }
         }).start();

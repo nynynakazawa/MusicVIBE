@@ -108,7 +108,7 @@
         style="@style/Widget.MaterialComponents.Button.OutlinedButton"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="BackGround"
+        android:text="@string/bg_start"
         android:visibility="gone"
         app:layout_constraintTop_toBottomOf="@+id/btnMute"
         app:layout_constraintStart_toStartOf="parent"

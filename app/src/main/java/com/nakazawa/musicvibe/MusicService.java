@@ -17,6 +17,7 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
+import androidx.annotation.Nullable;
 
 public class MusicService extends Service {
 
@@ -217,8 +218,9 @@ public class MusicService extends Service {
         public float  getPosition()           { return MusicService.this.getPosition(); }
         public boolean isPlaying()            { return MusicService.this.isPlaying(); }
         public void updateHapticScale()       { MusicService.this.updateHapticScale(); }
-        public void setAdvancedHapticsEnabled(boolean enabled) { MusicService.this.setAdvancedHapticsEnabled(enabled);
-        }
+        public void setAdvancedHapticsEnabled(boolean enabled) { MusicService.this.setAdvancedHapticsEnabled(enabled); }
+        public void startBackgroundHaptics() { MusicService.this.startBackgroundHaptics(); }
+        public void stopBackgroundHaptics() { MusicService.this.stopBackgroundHaptics(); }
     }
 
     /** 外部音声キャプチャ (BackGround ボタン) */
@@ -233,6 +235,25 @@ public class MusicService extends Service {
     void setAdvancedHapticsEnabled(boolean enabled) {
         this.advancedHapticsEnabled = enabled;
         Log.d(TAG, "Advanced Haptics Enabled → " + enabled);
+    }
+
+    void stopBackgroundHaptics() {
+        // 1. 既存の HapticEngine を解放
+        if (haptic != null) {
+            haptic.release();
+            haptic = null;
+        }
+        // 2. 既存の Visualizer を解放
+        if (visualizer != null) {
+            visualizer.release();
+            visualizer = null;
+        }
+        // 3. Primitive モード (Advanced Haptics OFF) を再アタッチ
+        int sessionId = player.getAudioSessionId();
+        haptic = new HapticEngine(this, sessionId);
+        updateHapticScale();
+        attachVisualizer(sessionId);  
+        updateHapticScale();
     }
 
     /*──────────────────────────
