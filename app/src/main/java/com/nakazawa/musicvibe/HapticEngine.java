@@ -1,7 +1,6 @@
 package com.nakazawa.musicvibe;
 
 import android.content.Context;
-import android.media.AudioFormat;
 import android.media.audiofx.HapticGenerator;
 import android.media.audiofx.Visualizer;
 import android.os.Build;
@@ -15,13 +14,14 @@ import android.util.Log;
 import androidx.annotation.RequiresApi;
 
 import java.util.concurrent.ArrayBlockingQueue;
+import android.os.CombinedVibration;
 
 /**
  * HapticEngine
  * ──────────────────────────────────────────────────────────────
  * ・アプリ内再生（audioSession > 0）
- *     ├─ HapticGenerator が使える端末→そのまま HG
- *     └─ 使えない端末           → Visualizer + Primitive 合成
+ *     ├─ HapticGenerator が使える端末 → そのまま HG
+ *     └─ 使えない端末 → Visualizer + Primitive 合成
  * ・BackGround 再生（audioSession == 0）
  *     └─ AudioRecord から PCM を受け取り，本 Runnable で滑らか振動
  */
@@ -29,12 +29,12 @@ import java.util.concurrent.ArrayBlockingQueue;
 public class HapticEngine {
 
     /*==== 共通定数 =====================================================*/
-    private static final String TAG = "HapticEngiine";
-    private static final int    FRAME_MS      = 10;   // Visualizer 版用（従来どおり）
-    private static final float  DEFAULT_SCALE = 0.7f; // 音量スケール初期値
+    private static final String TAG = "HapticEngine";
+    private static final int    FRAME_MS      = 20;   // Visualizer 版用（従来どおり）
+    private static final float  DEFAULT_SCALE = 1.2f; // 音量スケール初期値
 
     /*==== BackGround 専用定数 ==========================================*/
-    private static final int    FRAME_MS_BG   = 30;   // 1 フレーム 30 ms
+    private static final int    FRAME_MS_BG   = 10;   // 1 フレーム 30 ms
     private static final int    MIN_AMPLITUDE = 15;   // 振幅下限
     private static final double GATE_MARGIN   = 0.02; // ノイズ床 + 2 %
     /*==== フィールド ===================================================*/
@@ -52,43 +52,52 @@ public class HapticEngine {
     private int lastBgAmp = 0;
     private static final int AMP_DELTA       = 5;   // 振幅差の最小変化量
     private boolean bgLooping = false;
+    private volatile short[] latestPcm = new short[0];
+    private final Context mContext;
+    private final int     mAudioSessionId;
+    private volatile boolean isPaused = false;
+    private Visualizer visualizer;
+
+
+    public HapticEngine(Context context, int audioSessionId) {
+        this.mContext        = context;   // ← 初期化
+        this.mAudioSessionId = audioSessionId; // ← 初期化
+        this.vibrator        =
+                (Vibrator) mContext.getSystemService(Context.VIBRATOR_SERVICE);
+    }
+
 
     /*==================================================================*/
-    public HapticEngine(Context ctx, int audioSession) {
-        boolean hgAvailable = HapticGenerator.isAvailable() && audioSession > 0;
+
+    public HapticEngine(Context ctx, int audioSession, boolean forceFallback) {
+        // ① mContext, mAudioSessionId, vibrator はここで初期化される
+        this(ctx, audioSession);
+
+        // ② HapticGenerator 利用可否を判定
+        boolean hgAvailable = !forceFallback
+                && HapticGenerator.isAvailable()
+                && audioSession > 0;
         this.useHg = false;
 
-        /*――― Vibrator ―――*/
-        VibratorManager vm = ctx.getSystemService(VibratorManager.class);
-        vibrator = vm.getDefaultVibrator();
-
-        /*――― HapticGenerator 経路 ―――*/
         if (hgAvailable) {
             try {
                 hg = HapticGenerator.create(audioSession);
                 hg.setEnabled(true);
-                useHg  = true;
-                thread = null;
-                handler = null;
-                Log.d(TAG, "HapticGenerator enabled");
-                return; // HG が動くなら残りは不要
+                useHg = true;
+                return;
             } catch (Exception e) {
-                Log.w(TAG, "HapticGenerator init failed，fallbackへ", e);
+                Log.w(TAG, "HapticGenerator init failed, fallbackへ", e);
             }
         }
 
-        /*――― Fallback 経路 ―――*/
+        // ③ フォールバック経路
         if (audioSession == 0) {
-            /* BackGround モード（AudioRecord → PCM キュー） */
             thread = new HandlerThread("HapticEngineBgThread");
             thread.start();
             handler = new Handler(thread.getLooper());
             handler.postDelayed(processRmsRunnableBg, FRAME_MS_BG);
         } else {
-            /* アプリ内モード（Visualizer → Primitive 合成） */
-            setupPrimitiveVisualizer(audioSession);
-            thread  = null;
-            handler = null;
+            setupPrimitiveVisualizer();
         }
     }
 
@@ -162,20 +171,41 @@ public class HapticEngine {
     };
 
     /*==== Visualizer → Primitive 経路（従来どおり） ==================*/
-    private void setupPrimitiveVisualizer(int sessionId) {
+    private void setupPrimitiveVisualizer() {
         try {
-            Visualizer visualizer = new Visualizer(sessionId);
+            // ① もし前回の visualizer が生きていれば必ず無効化＆解放
+            if (visualizer != null) {
+                visualizer.setEnabled(false);   // 停止
+                visualizer.release();           // リソース解放
+            }
+
+            visualizer = new Visualizer(mAudioSessionId);
+            // ③ STATE_INITIALIZED の状態なのでキャプチャサイズ設定OK
             visualizer.setCaptureSize(Visualizer.getCaptureSizeRange()[1]);
             visualizer.setDataCaptureListener(
                     new Visualizer.OnDataCaptureListener() {
-                        @Override public void onWaveFormDataCapture(Visualizer v, byte[] wf, int sr) { }
-                        @Override public void onFftDataCapture(Visualizer v, byte[] fft, int sr) {
-                            processFftPrimitives(fft);
+                        @Override
+                        public void onWaveFormDataCapture(Visualizer v, byte[] wf, int sr) {
+                            if (wf == null) return;
+                            short[] pcm = new short[wf.length];
+                            for (int i = 0; i < wf.length; i++) {
+                                pcm[i] = (short) (((wf[i] & 0xFF) - 128) << 8);
+                            }
+                            latestPcm = pcm;
+                        }
+
+                        @Override
+                        public void onFftDataCapture(Visualizer v, byte[] fft, int sr) {
+                            // 一時停止中は振動処理に入らない
+                            if (isPaused) return;
+                            if (fft != null && latestPcm.length > 0) {
+                                processFftPrimitives(latestPcm, fft, mAudioSessionId);
+                            }
                         }
                     },
                     Visualizer.getMaxCaptureRate() / 2,
-                    false,
-                    true
+                    true,   // waveform
+                    true    // fft
             );
             visualizer.setEnabled(true);
         } catch (Exception e) {
@@ -183,53 +213,101 @@ public class HapticEngine {
         }
     }
 
-    private void processFftPrimitives(byte[] fft) {
+    public void pauseHaptics() {
+        isPaused = true;
+        vibrator.cancel();
+        if (visualizer != null) {
+            // キャプチャエンジンを停止するだけ → release() は呼ばない
+            visualizer.setEnabled(false);  // Visualizer must be disabled before release  [oai_citation:0‡Android Developers](https://developer.android.com/reference/android/media/audiofx/Visualizer?utm_source=chatgpt.com)
+        }
+    }
+
+    // 再開メソッド
+    public void resumeHaptics() {
+        if (!isPaused || visualizer == null) return;
+        isPaused = false;
+        visualizer.setEnabled(true);     // 再度キャプチャをオンにする  [oai_citation:1‡マイクロソフトラーニング](https://learn.microsoft.com/en-us/dotnet/api/android.media.audiofx.visualizer.setenabled?view=net-android-34.0&utm_source=chatgpt.com)
+    }
+
+    /**
+     * 時間領域（PCM）と周波数領域（FFT）の情報を解析し，
+     * ハプティクスを生成する。
+     */
+    private void processFftPrimitives(short[] pcm, byte[] fft, int audioSessionId) {
+        // 1) 時間領域：振幅ノーマライズ
+        int n = pcm.length / 3;
+        double bass   = rmsOf(pcm, 0,   n);
+        double melody = rmsOf(pcm, n, 2*n);
+        double other  = rmsOf(pcm, 2*n, pcm.length);
+        double weighted = 2.0*bass + 1.0*melody + 0.5*other;
+        double x = Math.min(1.0, weighted / 32768.0);
+        final double t = 0.3, lowExp = 5.0, highExp = 6.0;
+        double normAmp = (x < t)
+                ? Math.pow(x/t, lowExp) * 2.0
+                : 0.3 + Math.pow((x-t)/(1-t), highExp) * 4.0;
+        int rmsAmp = (int)(normAmp * userScale * 255);
+
+        // 2) 周波数領域：各帯域エネルギー比率
         int len = fft.length / 2;
         float[] mag = new float[len];
         for (int i = 0; i < len; i++) {
-            int re = fft[2 * i];
-            int im = fft[2 * i + 1];
-            mag[i] = (float) Math.hypot(re, im);
+            int re = fft[2*i], im = fft[2*i+1];
+            mag[i] = (float)Math.hypot(re, im);
         }
         int bassEnd = len * 200  / 22050;
         int midEnd  = len * 1500 / 22050;
-        double bassSum = 0, midSum = 0, highSum = 0;
+        double bassSum=0, midSum=0, highSum=0;
         for (int i = 0; i < len; i++) {
-            if (i < bassEnd)       bassSum += mag[i];
-            else if (i < midEnd)   midSum  += mag[i];
-            else                   highSum += mag[i];
+            if      (i < bassEnd) bassSum += mag[i];
+            else if (i < midEnd)  midSum  += mag[i];
+            else                  highSum += mag[i];
         }
-        double total = bassSum + midSum + highSum + 1e-9;
-        float bassNorm = (float) (bassSum / total);
-        float midNorm  = (float) (midSum  / total);
-        float highNorm = (float) (highSum / total);
+        float bassNorm = (float)(bassSum / (bassSum+midSum+highSum+1e-9));
+        float midNorm  = (float)(midSum  / (bassSum+midSum+highSum+1e-9));
+        float highNorm = (float)(highSum / (bassSum+midSum+highSum+1e-9));
 
+        // 3) Composition：プリミティブを追加
         boolean hasPrimitive = false;
         VibrationEffect.Composition comp = VibrationEffect.startComposition();
-        if (bassNorm > 0.2f) {
-            comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, bassNorm, 0);
+        if (bassNorm > 0.15f) {
+            comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_THUD,      bassNorm,   0);
             hasPrimitive = true;
         }
-        if (midNorm > 0.2f) {
-            comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_SPIN, midNorm, 50);
+        if (midNorm  > 0.15f) {
+            comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_SPIN,      midNorm,   60);
             hasPrimitive = true;
         }
-        if (highNorm > 0.2f) {
-            comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK, highNorm, 100);
+        if (highNorm > 0.15f) {
+            comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK,      highNorm,  120);
             hasPrimitive = true;
         }
-        if (hasPrimitive && vibrator.areAllPrimitivesSupported(
-                VibrationEffect.Composition.PRIMITIVE_CLICK,
+
+        // 4) 効果選択：プリミティブ有効かつサポートなら compose、そうでなければフォールバック
+        VibrationEffect effect;
+        if (hasPrimitive
+                && vibrator.areAllPrimitivesSupported(
+                VibrationEffect.Composition.PRIMITIVE_THUD,
                 VibrationEffect.Composition.PRIMITIVE_SPIN,
                 VibrationEffect.Composition.PRIMITIVE_TICK)) {
-            vibrator.vibrate(comp.compose());
-        } else {
-            float maxNorm = Math.max(bassNorm, Math.max(midNorm, highNorm));
-            int amp = (int) (255 * maxNorm * userScale);
-            if (amp > 0) {
-                vibrator.vibrate(VibrationEffect.createOneShot(FRAME_MS, amp));
+            effect = comp.compose();
+        }
+        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            effect = VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK);
+        }
+        else {
+            effect = VibrationEffect.createOneShot(FRAME_MS, rmsAmp);
+        }
+
+        // 5) CombinedVibration（API31+）または従来 vibrator.vibrate
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            VibratorManager vm = (VibratorManager)
+                    mContext.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+            if (vm != null) {
+                vm.vibrate(CombinedVibration.createParallel(effect));
+                return;
             }
         }
+        vibrator.vibrate(effect);
     }
 
     /*==== 外部公開メソッド ============================================*/

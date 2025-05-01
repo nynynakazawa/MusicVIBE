@@ -17,41 +17,34 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
-import androidx.annotation.Nullable;
 
 public class MusicService extends Service {
 
     private static final String TAG = "MusicService";
     private static final int NOTI_ID = 1;
 
-    private MediaPlayer    player;
-    private Visualizer     visualizer;
-    private HapticEngine   haptic;
+    private MediaPlayer player;
+    private Visualizer visualizer;
+    private HapticEngine haptic;
 
     private final IBinder binder = new ServiceBinder();
     private boolean isMuted = false;
     private boolean advancedHapticsEnabled = false;
     private boolean isPrepared = false;
 
-
-    /*──────────────────────────
-     * Service lifecycle
-     *──────────────────────────*/
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
 
-        // MediaPlayer を生成し、ハプティック用の AudioAttributes を設定
         player = new MediaPlayer();
         AudioAttributes attrs = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .setHapticChannelsMuted(false)           // haptic チャンネルを有効化
+                .setHapticChannelsMuted(false)
                 .build();
         player.setAudioAttributes(attrs);
 
-        // 再生完了時の後始末
         player.setOnCompletionListener(mp -> {
             stopSelf();
             updateNotification("停止しました");
@@ -62,9 +55,9 @@ public class MusicService extends Service {
 
     @Override
     public void onDestroy() {
-        if (visualizer != null) visualizer.release();
-        if (haptic     != null) haptic.release();
-        if (player     != null) {
+        releaseVisualizer();
+        if (haptic != null) haptic.release();
+        if (player != null) {
             player.stop();
             player.release();
             isPrepared = false;
@@ -72,9 +65,6 @@ public class MusicService extends Service {
         super.onDestroy();
     }
 
-    /*──────────────────────────
-     * Public control methods
-     *──────────────────────────*/
     public void load(String uriStr) {
         try {
             player.reset();
@@ -84,11 +74,8 @@ public class MusicService extends Service {
             player.start();
             updateNotification("再生中…");
 
-            int sessionId = player.getAudioSessionId();
-            if (haptic != null) haptic.release();
-            haptic = new HapticEngine(this, sessionId);   // Visualizer も内部でセット
-
-            updateHapticScale();                          // 音量に合わせてスケール調整
+            int sid = player.getAudioSessionId();
+            rebuildHapticEngine(sid);
         } catch (Exception e) {
             Log.e(TAG, "load error", e);
             updateNotification("エラーが発生しました");
@@ -99,9 +86,11 @@ public class MusicService extends Service {
         if (player.isPlaying()) {
             player.pause();
             updateNotification("一時停止中…");
+            if (haptic != null) haptic.pauseHaptics();
         } else {
             player.start();
             updateNotification("再生中…");
+            if (haptic != null) haptic.resumeHaptics();
         }
     }
 
@@ -119,20 +108,13 @@ public class MusicService extends Service {
 
     public float getDuration() {
         try {
-            if (player != null) {
-                // Prepared, Started, Paused, PlaybackCompleted 状態でのみ getDuration() が許可されています
-                return player.getDuration();
-            } else {
-                return 0f;
-            }
+            return (player != null) ? player.getDuration() : 0f;
         } catch (IllegalStateException e) {
-            // MediaPlayer が不正な状態（Idle や Initialized）で呼び出された場合の例外を抑制
             Log.w(TAG, "getDuration called in wrong state", e);
             return 0f;
         }
     }
 
-    // 同様に getPosition() も安全化しておくとより堅牢です
     public float getPosition() {
         try {
             return (player != null) ? player.getCurrentPosition() : 0f;
@@ -141,7 +123,8 @@ public class MusicService extends Service {
             return 0f;
         }
     }
-    public boolean isPlaying()    { return player.isPlaying(); }
+
+    public boolean isPlaying() { return player.isPlaying(); }
 
     public void updateHapticScale() {
         AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
@@ -150,19 +133,26 @@ public class MusicService extends Service {
         if (haptic != null) haptic.setUserScale(scale);
     }
 
-    /*──────────────────────────
-     * Visualizer & Haptic
-     *──────────────────────────*/
-    private void attachVisualizer(int sessionId) {
-        if (sessionId <= 0) {
-            Log.e(TAG, "Invalid audioSessionId: " + sessionId);
-            return;
+    private void releaseVisualizer() {
+        if (visualizer != null) {
+            try { visualizer.setEnabled(false); } catch (Exception ignore) {}
+            visualizer.release();
+            visualizer = null;
         }
-        if (visualizer != null) visualizer.release();
+    }
 
+    private void attachVisualizer(int sessionId) {
+        if (!advancedHapticsEnabled) return;
+        releaseVisualizer();
         try {
             visualizer = new Visualizer(sessionId);
-            visualizer.setCaptureSize(Visualizer.getCaptureSizeRange()[1]);
+            // setCaptureSize は STATE_INITIALIZED でのみ有効だが例外が出る場合はスキップ
+            int maxSize = Visualizer.getCaptureSizeRange()[1];
+            try {
+                visualizer.setCaptureSize(maxSize);
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "Visualizer setCaptureSize skipped, wrong state", e);
+            }
             visualizer.setDataCaptureListener(
                     new Visualizer.OnDataCaptureListener() {
                         @Override public void onWaveFormDataCapture(Visualizer v, byte[] wf, int sr) {}
@@ -175,15 +165,12 @@ public class MusicService extends Service {
                     true
             );
             visualizer.setEnabled(true);
-            Log.d(TAG, "Visualizer attached to session " + sessionId);
         } catch (Exception e) {
             Log.e(TAG, "Visualizer init error", e);
+            releaseVisualizer();
         }
     }
 
-    /*──────────────────────────
-     * Notification helpers
-     *──────────────────────────*/
     private Notification buildNotification(String text) {
         return new NotificationCompat.Builder(this, "music_haptic")
                 .setSmallIcon(android.R.drawable.ic_media_play)
@@ -205,11 +192,17 @@ public class MusicService extends Service {
         getSystemService(NotificationManager.class).createNotificationChannel(ch);
     }
 
-    /*──────────────────────────
-     * Binder
-     *──────────────────────────*/
+    private void rebuildHapticEngine(int sessionId) {
+        releaseVisualizer();
+        if (haptic != null) haptic.release();
+        boolean forceFallback = !advancedHapticsEnabled;
+        haptic = new HapticEngine(this, sessionId, forceFallback);
+        updateHapticScale();
+        attachVisualizer(sessionId);
+    }
+
     public class ServiceBinder extends Binder {
-        public boolean isPrepared() { return MusicService.this.isPrepared; }
+        public boolean isPrepared()           { return MusicService.this.isPrepared; }
         public void load(String uri)          { MusicService.this.load(uri); }
         public void togglePlayPause()         { MusicService.this.togglePlayPause(); }
         public void toggleMute()              { MusicService.this.toggleMute(); }
@@ -218,48 +211,39 @@ public class MusicService extends Service {
         public float  getPosition()           { return MusicService.this.getPosition(); }
         public boolean isPlaying()            { return MusicService.this.isPlaying(); }
         public void updateHapticScale()       { MusicService.this.updateHapticScale(); }
-        public void setAdvancedHapticsEnabled(boolean enabled) { MusicService.this.setAdvancedHapticsEnabled(enabled); }
-        public void startBackgroundHaptics() { MusicService.this.startBackgroundHaptics(); }
-        public void stopBackgroundHaptics() { MusicService.this.stopBackgroundHaptics(); }
+
+        public void setAdvancedHapticsEnabled(boolean enabled) {
+            advancedHapticsEnabled = enabled;
+            rebuildHapticEngine(player.getAudioSessionId());
+            Log.d(TAG, "Advanced Haptics Enabled → " + enabled);
+        }
+
+        public void startBackgroundHaptics()  { startBackgroundHaptics(); }
+        public void stopBackgroundHaptics()   { stopBackgroundHaptics(); }
+        public void pauseHaptics()            { if (haptic != null) haptic.pauseHaptics(); }
+        public void resumeHaptics()           { if (haptic != null) haptic.resumeHaptics(); }
     }
 
-    /** 外部音声キャプチャ (BackGround ボタン) */
     public void startBackgroundHaptics() {
-        int sessionId = 0;                                // グローバル出力ミックス
+        releaseVisualizer();
         if (haptic != null) haptic.release();
-        haptic = new HapticEngine(this, sessionId);       // Visualizer は内部で開始
+        haptic = new HapticEngine(this, 0, !advancedHapticsEnabled);
         updateHapticScale();
-        Log.d(TAG, "Background haptics started on session " + sessionId);
+        Log.d(TAG, "Background haptics started (session 0)");
     }
 
-    void setAdvancedHapticsEnabled(boolean enabled) {
-        this.advancedHapticsEnabled = enabled;
-        Log.d(TAG, "Advanced Haptics Enabled → " + enabled);
-    }
-
-    void stopBackgroundHaptics() {
-        // 1. 既存の HapticEngine を解放
+    public void stopBackgroundHaptics() {
         if (haptic != null) {
             haptic.release();
             haptic = null;
         }
-        // 2. 既存の Visualizer を解放
-        if (visualizer != null) {
-            visualizer.release();
-            visualizer = null;
-        }
-        // 3. Primitive モード (Advanced Haptics OFF) を再アタッチ
-        int sessionId = player.getAudioSessionId();
-        haptic = new HapticEngine(this, sessionId);
-        updateHapticScale();
-        attachVisualizer(sessionId);  
-        updateHapticScale();
+        int sid = player.getAudioSessionId();
+        rebuildHapticEngine(sid);
+        Log.d(TAG, "Background haptics stopped");
     }
 
-    /*──────────────────────────
-     * Binder entry
-     *──────────────────────────*/
-    @Nullable @Override
+    @Nullable
+    @Override
     public IBinder onBind(Intent intent) {
         return binder;
     }

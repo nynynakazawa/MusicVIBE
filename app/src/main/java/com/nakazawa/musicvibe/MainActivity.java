@@ -29,46 +29,75 @@ import android.widget.Button;
 
 public class MainActivity extends AppCompatActivity {
 
-    private Button btnPlay, btnMute, btnLoad, btnBackground;
+    // ファイル選択ランチャーと保留 URI
+    private ActivityResultLauncher<String[]> filePicker;
+    private Uri pendingLoadUri = null;
+    // サービスバインド状態と UI ボタン
+    private boolean isBound = false;
+    private Button btnLoad;
+
+    private Button btnPlay, btnMute, btnBackground;
     private TextView txtTitle;
     private SeekBar seek;
-    private boolean isBound = false;
     private MusicService.ServiceBinder binder;
     private static final int REQUEST_RECORD = 1001;
-    private boolean advancedHapticsEnabled = false;
-    private static final String TAG = "MainActivity";
     private Handler updateHandler;
     private static final int REQUEST_CODE_CAPTURE_PERM = 1001;
     private static final int REQUEST_BACKGROUND = 2002;
-    private static final String TEXT_BG_START = "BackGround";
-    private static final String TEXT_BG_STOP  = "StopBackGround";
+    private boolean isBackgroundMode = false;
 
-    private boolean isBackgroundMode = false;   // 現在バックグラウンド処理中かどうか
 
 
     /** Activity ↔ Service 接続 */
     private final ServiceConnection connection = new ServiceConnection() {
-        @Override public void onServiceConnected(ComponentName name, IBinder service) {
-            binder = (MusicService.ServiceBinder) service;
-            isBound = true;
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            binder   = (MusicService.ServiceBinder) service;
+            isBound  = true;
+
+            // ① ボタンを有効化
+            btnLoad.setEnabled(true);  // ◆初回グレーアウトの解消 [oai_citation:7‡Stack Overflow](https://stackoverflow.com/questions/14412238/android-how-to-enable-button-when-service-complete-its-task?utm_source=chatgpt.com)
+
+            // ② 保留中のファイルがあればロード
+            if (pendingLoadUri != null) {
+                loadTrack(pendingLoadUri);
+                pendingLoadUri = null;
+            }
+
+            // ③ UI 更新ループを開始
             observePlayer();
         }
-        @Override public void onServiceDisconnected(ComponentName name) { isBound = false; }
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            isBound = false;
+        }
     };
 
 
-    /** mp3 選択 */
-    private final ActivityResultLauncher<String[]> filePicker =
-            registerForActivityResult(new ActivityResultContracts.OpenDocument(),
-                    uri -> {
-                        if (uri != null) loadTrack(uri);
-                    });
+    private void registerFilePicker() {
+        filePicker = registerForActivityResult(
+                new ActivityResultContracts.OpenDocument(),
+                uri -> {
+                    if (uri == null) return;
+                    // サービス接続済みなら即ロード、未接続なら保留
+                    if (isBound) {
+                        loadTrack(uri);
+                    } else {
+                        pendingLoadUri = uri;
+                    }
+                }
+        );
+    }
 
+    /** mp3 選択 */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // ① 権限チェックとサービス起動は従来どおり
+        // ① ファイルピッカー登録 (最優先)
+        registerFilePicker();  // ◆これがないと uri が未定義になります
+
+        // ② 権限チェック → 許可済ならサービス起動
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(
@@ -82,8 +111,13 @@ public class MainActivity extends AppCompatActivity {
 
         setContentView(R.layout.activity_main);
 
-        // ② UI コンポーネントの取得
+        // ③ ボタン初期化：サービス接続完了まで押せないようにする
         btnLoad = findViewById(R.id.btnLoad);
+        btnLoad.setEnabled(false);  // ◆ここでグレーアウト
+        btnLoad.setOnClickListener(v -> {
+            filePicker.launch(new String[]{"audio/mpeg"});
+        });
+
         btnPlay = findViewById(R.id.btnPlay);
         btnMute = findViewById(R.id.btnMute);
         txtTitle = findViewById(R.id.txtTitle);
@@ -232,13 +266,14 @@ public class MainActivity extends AppCompatActivity {
                                            @NonNull String[] permissions,
                                            @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQUEST_BACKGROUND) {
+        if (requestCode == REQUEST_RECORD) {
             if (grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                requestScreenCapture();
+                // 音声キャプチャの許可が降りたらサービスを開始
+                startAndBindService();
             } else {
                 Toast.makeText(this,
-                        "録音権限がないとバックグラウンドキャプチャできません",
+                        "録音権限がないとハプティクスが動作しません",
                         Toast.LENGTH_LONG
                 ).show();
             }
@@ -288,6 +323,22 @@ public class MainActivity extends AppCompatActivity {
             return handled;
         }
         return super.onKeyUp(keyCode, event);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (isBound && binder != null) {
+            binder.pauseHaptics();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (isBound && binder != null) {
+            binder.resumeHaptics();
+        }
     }
 
     @Override
